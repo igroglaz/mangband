@@ -931,7 +931,7 @@ void show_inven(void)
 
 	/* Hack -- ensure we never try to truncate out of array bounds */
 	truncate = lim;
-	if (truncate < 0) truncate = 0;
+	if (lim < 0) truncate = 0;
 	if (truncate > sizeof(o_name) - 1) truncate = sizeof(o_name) - 1;
 
 	/* Find the "final" slot */
@@ -1063,7 +1063,7 @@ void show_equip(void)
 
 	/* Hack -- ensure we never try to truncate out of array bounds */
 	truncate = lim;
-	if (truncate < 0) truncate = 0;
+	if (lim < 0) truncate = 0;
 	if (truncate > sizeof(o_name) - 1) truncate = sizeof(o_name) - 1;
 
 	/* Scan the equipment list */
@@ -3182,6 +3182,7 @@ void redraw_stuff(void)
 void window_stuff(void)
 {
 	int i;
+	u32b window_flags = p_ptr->window; /* Store current flags */
 
 	/* Window stuff */
 	if (!p_ptr->window) return;
@@ -3301,4 +3302,7 @@ void window_stuff(void)
 		p_ptr->window &= ~(PW_ITEMLIST);
 		fix_remote_term(NTERM_WIN_ITEMLIST, PW_ITEMLIST);
 	}
+
+	/* Hack -- trigger Term2 event */
+	Term_window_updated(window_flags);
 }

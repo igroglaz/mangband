@@ -27,7 +27,6 @@ TODO:
 #include "sdl-sound.h"
 
 #ifdef WINDOWS
-#define snprintf _snprintf
 double fmin(double x, double y)
 {
 	return (x < y ? x : y);
@@ -146,11 +145,13 @@ void Term2_refresh_char(int x, int y);
 bool Term2_cave_char(int x, int y, byte a, char c, byte ta, char tc);
 void Term2_query_area_size(s16b *x, s16b *y, int st);
 void Term2_screen_keyboard(int show, int hint);
-bool Term2_ask_dir(char *prompt, bool allow_target, bool allow_friend);
-bool Term2_ask_command(char *prompt);
+void Term2_window_updated(u32b flags);
+bool Term2_ask_dir(const char *prompt, bool allow_target, bool allow_friend);
+bool Term2_ask_command(const char *prompt, bool shopping);
 bool Term2_ask_item(const char *prompt, bool mode, bool inven, bool equip, bool onfloor);
 bool Term2_ask_spell(const char *prompt, int realm, int book);
-
+bool Term2_ask_confirm(const char *prompt);
+bool Term2_ask_menu(menu_type *menu, menu_get_entry func, int row, int col);
 
 /* Helpers */
 
@@ -178,6 +179,14 @@ static bool isHighDPI(void)
 	SDL_GetWindowSize(terms[i].window, &winW, &winH);
 	getRendererSize(&terms[i], &highW, &highH);
 	return (winW == highW && winH == highH) ? FALSE : TRUE;
+#endif
+}
+static void mobileForceOptions(void)
+{
+#ifdef USE_ICON_OVERLAY
+	auto_itemlist = FALSE;
+	auto_showlist = FALSE;
+	auto_accept = FALSE;
 #endif
 }
 static void mobileAutoLayout(void)
@@ -225,11 +234,14 @@ enum IconContext {
 	MICONS_ITEM,
 	MICONS_SPELL,
 	MICONS_COMMANDS,
+	MICONS_CONFIRMATION,
+	MICONS_PASSED_MENU,
 
 	MICONS_SYSTEM,
 	MICONS_QUICKEST,
 	MICONS_ALTER,
 	MICONS_INVEN,
+	MICONS_STORE,
 	MICONS_EQUIP,
 	MICONS_SPELLS,
 	MICONS_SELECTOR_CLOSE,
@@ -253,6 +265,10 @@ static bool micon_allow_equip = FALSE;
 static bool micon_allow_floor = FALSE;
 static int micon_spell_realm = -1;
 static int micon_spell_book = -1;
+static menu_type* micon_passed_menu = NULL;
+static menu_get_entry micon_passed_menu_resolver = NULL;
+static int micon_passed_menu_row = 0;
+static int micon_passed_menu_col = 0;
 
 typedef struct IconData IconData;
 struct IconData {
@@ -272,6 +288,8 @@ static bool dragging_icon = FALSE;
 typedef struct SlotData SlotData;
 struct SlotData {
 	char macro_act[1024]; /* Macro to execute */
+	char macro_item[1024]; /* Stand-alone item name (if any) */
+	int item_counter; /* "cached" counter for items */
 	int action;     /* IconAction to execute */
 	int sub_action; /* IconAction argument */
 	int draw;   /* Icon index from UI font */
@@ -397,12 +415,12 @@ errr init_sdl2(void) {
 
 #ifdef USE_ICON_OVERLAY
 	loadCmdFont("ui-cmd.ttf");
-#ifdef USE_SDL2_TTF
+#  ifdef USE_SDL2_TTF
 	loadTinyFont("5X8.FON");
-#else
+#  else
 	loadTinyFont("misc6x13.hex");
+#  endif
 #endif
-	#endif
 
 #ifdef USE_LISENGLAS
 	loadUiCircle();
@@ -417,10 +435,13 @@ errr init_sdl2(void) {
 	query_size_aux = Term2_query_area_size;
 	refresh_char_aux = Term2_refresh_char;
 	screen_keyboard_aux = Term2_screen_keyboard;
+	window_updated_aux = Term2_window_updated;
 	z_ask_command_aux = Term2_ask_command;
 	z_ask_dir_aux = Term2_ask_dir;
 	z_ask_item_aux = Term2_ask_item;
 	z_ask_spell_aux = Term2_ask_spell;
+	z_ask_confirm_aux = Term2_ask_confirm;
+	z_ask_menu_aux = Term2_ask_menu;
 
 	return 0;
 }
@@ -430,6 +451,15 @@ void quit_sdl2(cptr s)
 {
 	/* save all values */
 	saveConfig();
+
+	/* Unload various things */
+#ifdef USE_ICON_OVERLAY
+	unloadCmdFont();
+	unloadTinyFont();
+#endif
+#ifdef USE_LISENSGLAS
+	unloadUiCircle();
+#endif
 
 	/* Call regular quit hook */
 	quit_hook(s);
@@ -771,14 +801,27 @@ void Term2_screen_keyboard(int show, int hint)
 	}
 #endif
 }
+#ifdef USE_ICON_OVERLAY
+/* Forward-declare: */static void recountSlotItems(void);
+#endif
+void Term2_window_updated(u32b flags)
+{
+#ifdef USE_ICON_OVERLAY
+	if ((flags & PW_INVEN) | (flags & PW_EQUIP))
+	{
+		recountSlotItems();
+	}
+#endif
+}
 
-bool Term2_ask_command(char *prompt)
+bool Term2_ask_command(const char *prompt, bool shopping)
 {
 	term2_icon_context = MICONS_COMMANDS;
+	if (shopping) term2_icon_context = MICONS_STORE;
 	return FALSE;
 }
 
-bool Term2_ask_dir(char *prompt, bool allow_target, bool allow_friend)
+bool Term2_ask_dir(const char *prompt, bool allow_target, bool allow_friend)
 {
 	term2_icon_context = MICONS_DIRECTION;
 	micon_allow_target = allow_target;
@@ -800,6 +843,22 @@ bool Term2_ask_spell(const char *prompt, int realm, int book)
 	micon_spell_realm = realm;
 	micon_spell_book = book;
 	return FALSE;
+}
+bool Term2_ask_confirm(const char *prompt)
+{
+	term2_icon_context = MICONS_CONFIRMATION;
+	return FALSE;
+}
+
+bool Term2_ask_menu(menu_type *menu, menu_get_entry func, int row, int col)
+{
+	term2_icon_context = MICONS_PASSED_MENU;
+	micon_passed_menu = menu;
+	micon_passed_menu_resolver = func;
+	micon_passed_menu_row = row;
+	micon_passed_menu_col = col;
+	if (menu == NULL) term2_icon_context = -1;
+	return (FALSE);
 }
 
 void net_stream_clamp(int addr, int *x, int *y) {
@@ -844,7 +903,7 @@ void refreshTermAlt(TermData *td) {
 		td->alt_fb_h = 0;
 		if (td->need_redraw) {
 			// (re)subscribe
-			net_term_update(TRUE);
+			net_term_update(FALSE);
 		}
 		return;
 	}
@@ -883,7 +942,7 @@ void refreshTermAlt(TermData *td) {
 	SDL_RenderClear(td->renderer);
 
 	// (re)subscribe
-	net_term_update(TRUE);
+	net_term_update(FALSE);
 
 	td->need_redraw = TRUE;
 }
@@ -1250,7 +1309,7 @@ static void renderWindow(TermData *mtd)
 
 		SDL_RenderCopy(terms[0].renderer, terms[0].alt_framebuffer, &src, &dst);
 		/* Render cursor */
-		if (mtd->pict_data)
+		if (mtd->pict_data && alt_cursor_y >= 0)
 		{
 			SDL_Rect cell_rect;
 			cell_rect.w = mtd->pict_data->w * terms[0].zoom /100;
@@ -1312,8 +1371,13 @@ static int looksLikeCave(int x, int y)
 	{
 		if (state < PLAYER_PLAYING) return 0;
 		if (screen_icky) return 0;
-		if (section_icky_row) return 0;
-		if (section_icky_col) return 0;
+		if (section_icky_row > 0 && y < section_icky_row)
+		{
+			if (section_icky_col > 0 && x < section_icky_col)
+				return 0;
+			if (section_icky_col < 0 && x >= td->cols + section_icky_col)
+				return 0;
+		}
 		return 1;
 	}
 	return 0;
@@ -1338,13 +1402,15 @@ static void altDungeonCutout(void)
 		byte *old_taa = Term->old->ta[y];
 		char *old_tcc = Term->old->tc[y];
 
-		if (section_icky_row > 0 && y < section_icky_row)
-			continue;
-
 		for (x = sx; x < td->cols; x++)
 		{
-			if (section_icky_col > 0 && x > section_icky_col)
-				continue;
+			if (section_icky_row > 0 && y < section_icky_row)
+			{
+				if (section_icky_col > 0 && x < section_icky_col)
+					continue;
+				if (section_icky_col < 0 && x >= td->cols + section_icky_col)
+					continue;
+			}
 
 			wipeTermCell_UI(x, y, 1);
 
@@ -1375,7 +1441,7 @@ static void rerender()
 		}
 		if (terms[i].need_cutout) {
 			altDungeonCutout();
-			terms[i].need_cutout = 0;
+			terms[i].need_cutout = FALSE;
 		}
 	}
 	for (i = 0; i < TERM_MAX; i++) {
@@ -2206,7 +2272,7 @@ static void handleMouseClick(int i, int wx, int wy, int sdlbutton)
 		int button = 0;
 		int cx = (wx - terms[i].ren_rect.x) / terms[i].cell_w;
 		int cy = (wy - terms[i].ren_rect.y) / terms[i].cell_h;
-		if (terms[i].config & TERM_DO_SCALE)
+		if ((terms[i].config & TERM_DO_SCALE) && !screen_icky)
 		{
 			if (wx >= terms[i].ren_rect.x + terms[i].dng_rect.x
 			 && wy >= terms[i].ren_rect.y + terms[i].dng_rect.y
@@ -2408,6 +2474,11 @@ static void handleMouseEvent(SDL_Event *ev)
 	int i;
 	int wx, wy;
 
+	int icon_drag_threshold = MICON_W / 2;
+#ifdef MOBILE_UI
+	/* Easier for fat fingers */
+	icon_drag_threshold *= 2;
+#endif
 	if (menu_mode)
 	{
 		bool handled = handleMouseEvent_Menu(ev);
@@ -2440,8 +2511,8 @@ static void handleMouseEvent(SDL_Event *ev)
 		{
 			if (!dragging_icon)
 			{
-				if ((ABS(icon_pressed_x - wx) > 16)
-				|| (ABS(icon_pressed_y - wy) > 16))
+				if ((ABS(icon_pressed_x - wx) > icon_drag_threshold)
+				|| (ABS(icon_pressed_y - wy) > icon_drag_threshold))
 				{
 					dragging_icon = TRUE;
 					drag_icon = icons[icon_pressed];
@@ -2524,7 +2595,11 @@ static void handleMouseEvent(SDL_Event *ev)
 				dragging_icon = FALSE;
 				return;
 			}
-			//icon_hover = matchIcon(wx, wy);
+#ifdef MOBILE_UI
+			/* On mobile, it's possible to press without hovering first,
+			 * so we shall re-evalute the button we're over */
+			icon_hover = matchIcon(wx, wy);
+#endif
 			if (icon_hover >= 0)
 			{
 				handleMIcon(icons[icon_hover].action, icons[icon_hover].sub_action);
@@ -2584,6 +2659,7 @@ static int hackyShift(int key)
 	else if (key == '.') return '<';
 	else if (key == ',') return '>';
 	else if (key == '/') return '?';
+	return key;
 }
 
 static void handleKeyboardEvent(SDL_Event *ev)
@@ -2648,6 +2724,7 @@ static void handleKeyboardEvent(SDL_Event *ev)
 		if (key >= SDLK_LCTRL && key <= SDLK_RGUI)
 		{
 			Noticemodkeypress(key, 1);
+			return;
 		}
 
 		/* ASCII */
@@ -2655,9 +2732,6 @@ static void handleKeyboardEvent(SDL_Event *ev)
 		{
 			/* Space is already handled by text input, ignore */
 			if (!ignore_keyboard_layout && key == ' ' && mod == 0) return;
-
-			/* Ignore modifier keypresses */
-			if (key >= SDLK_LCTRL && key <= SDLK_RGUI) return;
 
 			/* Printable charater */
 			if (isgraph(key))
@@ -2720,19 +2794,19 @@ static void handleKeyboardEvent(SDL_Event *ev)
 			strnfmt(buf, 32, "%c%s%s%s%s_%lX%c", 31,
 				    ev->key.keysym.mod & KMOD_CTRL  ? "N" : "",
 				    ev->key.keysym.mod & KMOD_SHIFT ? "S" : "",
-				    "",
-				    ev->key.keysym.mod & KMOD_ALT   ? "M" : "",
+				    ev->key.keysym.mod & KMOD_ALT   ? "O" : "",
+				    ev->key.keysym.mod & KMOD_GUI   ? "M" : "",
 				    (unsigned long) key, 13);
 #ifdef DEBUG
-			printf("Macro: ^_%s%s%s%s_%lX\\r%s\n",
+			printf("Macro: ^_%s%s%s%s_%lX\\r\n",
 				    ev->key.keysym.mod & KMOD_CTRL  ? "N" : "",
 				    ev->key.keysym.mod & KMOD_SHIFT ? "S" : "",
-				    "",
-				    ev->key.keysym.mod & KMOD_ALT   ? "M" : "",
+				    ev->key.keysym.mod & KMOD_ALT   ? "O" : "",
+				    ev->key.keysym.mod & KMOD_GUI   ? "M" : "",
 				    (unsigned long) key);
 #endif
 			Term_multikeypress(buf);
-			sent = TRUE;	
+			sent = TRUE;
 		}
 		if (!sent)
 		{
@@ -2839,6 +2913,12 @@ static errr xtraTermHook(int n, int v) {
 		SDL_SetRenderDrawBlendMode(td->renderer, SDL_BLENDMODE_BLEND);
 		return 0; // clear?
 	case TERM_XTRA_REACT:
+#ifdef MOBILE_UI
+		if (v == TERM_XTRA_REACT_OPTIONS)
+		{
+			mobileForceOptions();
+		}
+#endif
 		setTermTitle(&terms[TERM_MAIN]);
 		refreshTerm(&terms[TERM_MAIN]);
 		return 0; // react?
@@ -2869,8 +2949,11 @@ static errr cursTermHook(int x, int y)
 	/* Alt.Dungeon cursor */
 	if (td->config & TERM_DO_SCALE)
 	{
-		alt_cursor_x = x - DUNGEON_OFFSET_X;
-		alt_cursor_y = y - DUNGEON_OFFSET_Y;
+		if (looksLikeCave(x, y))
+		{
+			alt_cursor_x = x - DUNGEON_OFFSET_X;
+			alt_cursor_y = y - DUNGEON_OFFSET_Y;
+		}
 	}
 
 	return 0;
@@ -2938,7 +3021,7 @@ static errr wipeTermHook(int x, int y, int n)
 			alt_cursor_x = -1;
 			alt_cursor_y = -1;
 		}
-		td->need_cutout = TRUE;
+		if (looksLikeCave(x, y)) td->need_cutout = TRUE;
 	}
 	return 0;
 }
@@ -3029,7 +3112,8 @@ static errr textTermHook_ALT(int x, int y, int n, byte attr, cptr s)
 
 static errr textTermHook(int x, int y, int n, byte attr, cptr s)
 {
-	int i, alt_dungeon = 0;
+	int i;
+	bool probably_cave = FALSE;
 	TermData *td = (TermData*)(Term->data);
 	struct FontData *fd = td->font_data;
 	SDL_SetTextureColorMod(td->font_texture, TERM_RGB(attr));
@@ -3042,11 +3126,12 @@ static errr textTermHook(int x, int y, int n, byte attr, cptr s)
 	{
 		wipeTermCell_UI(x + i, y, 0);
 		textTermCell_Char(x + i, y, attr, s[i]);
+		if (!probably_cave) probably_cave = looksLikeCave(x + i, y);
 	}
 
 	if (td->config & TERM_DO_SCALE)
 	{
-		td->need_cutout = TRUE;
+		if (probably_cave) td->need_cutout = TRUE;
 	}
 
 	return 0;
@@ -3176,6 +3261,7 @@ static errr pictTermHook_ALT(int x, int y, int n, const byte *ap, const char *cp
 static errr pictTermHook(int x, int y, int n, const byte *ap, const char *cp, const byte *tap, const char *tcp)
 {
 	int i;
+	bool probably_cave = FALSE;
 	Uint8 a,  c;
 	Uint8 ta, tc;
 
@@ -3196,11 +3282,13 @@ static errr pictTermHook(int x, int y, int n, const byte *ap, const char *cp, co
 
 		wipeTermCell_UI(x + i, y, 0);
 		pictTermCell_Tile(x + i, y, a, c, ta, tc);
+
+		if (!probably_cave) probably_cave = looksLikeCave(x + i, y);
 	}
 
 	if (td->config & TERM_DO_SCALE)
 	{
-		td->need_cutout = TRUE;
+		if (probably_cave) td->need_cutout = TRUE;
 	}
 
 	return 0;
@@ -3246,6 +3334,9 @@ static errr handleMenu(int i, int x, int y) {
 		
 		/* Move it around */
 		termConstrain(i);
+
+		/* Also, redraw main window */
+		terms[0].need_render = TRUE;
 	}
 
 	if (menu_hover == MENU_ACT_CLOSE) {
@@ -3361,6 +3452,7 @@ static errr handleMenu(int i, int x, int y) {
 	{
 		menu_open = menu_hover;
 		menu_open_term = menu_term;
+		terms[menu_term].need_render = TRUE;
 	}
 	return 0;
 }
@@ -3452,8 +3544,13 @@ static void updateLisenglas(int wx, int wy)
 	/* Finger inside */
 	if (wy >= lisen_y && wy <= lisen_y + LISEN_H*2 + 32)
 	{
-		/* Downwards */
-		lisen_y = wy + LISEN_H - 32;
+#ifndef MOBILE_UI
+		/* Downwards (this looks most logical) */
+		lisen_x -= wy + LISEN_H - 32;
+#else
+		/* Leftwards (on mobile, we should never draw UNDER the finger) */
+		lisen_x -= lh;
+#endif
 	}
 
 	/* Clamp left/right */
@@ -3593,8 +3690,14 @@ static void renderIconOverlay(TermData *td)
 	/* Display Dragged Icon */
 	if (dragging_icon)
 	{
-		iconPict(&drag_icon.pos, drag_icon.a, drag_icon.c, FALSE);
-		drawUiIcon(&drag_icon.pos, drag_icon.draw);
+		SDL_Rect pos = drag_icon.pos;
+#ifdef MOBILE_UI
+		/* On mobile user's finger is convering the icon, move it */
+		pos.x -= MICON_W;
+		pos.y -= MICON_H;
+#endif
+		iconPict(&pos, drag_icon.a, drag_icon.c, FALSE);
+		drawUiIcon(&pos, drag_icon.draw);
 	}
 
 
@@ -3625,6 +3728,17 @@ static void renderIconOverlay(TermData *td)
 		renderMIcon(&pos, &pos, MICON_TOGGLE_OVERLAY, 0, MICO_FINGER_CLICK, 10);
 	}
 
+	/* Angband menu (show even on icky screens) */
+	if (term2_icon_context == MICONS_PASSED_MENU)
+	{
+		SDL_Rect pane = {
+			td->cell_w * micon_passed_menu_col,
+			td->cell_h * micon_passed_menu_row, max_w, max_h };
+		pane.w -= pane.x;
+		pane.h -= pane.y;
+		drawIconPanel_PassedMenu(&pane);
+	}
+
 	if (state != PLAYER_PLAYING) return;
 
 	/* Quick-slots */
@@ -3634,7 +3748,7 @@ static void renderIconOverlay(TermData *td)
 		drawIconPanel_Slots(&pane2);
 	}
 
-	if (screen_icky) return;
+	if (screen_icky && !shopping) return;
 	if (section_icky_row) return;
 
 	SDL_SetRenderDrawBlendMode(td->renderer, SDL_BLENDMODE_BLEND);
@@ -3648,9 +3762,14 @@ static void renderIconOverlay(TermData *td)
 		SDL_Rect pane = { max_w - icon_ws * 3, max_h - icon_hs * 3, icon_ws * 3, icon_hs * 3 };
 		drawIconPanel_Direction(&pane, micon_allow_target, micon_allow_friend);
 	}
+	else if (term2_icon_context == MICONS_CONFIRMATION)
+	{
+		SDL_Rect pane = { max_w / 2 - icon_ws * 2, max_h / 2 - icon_hs / 2, icon_ws * 3 * 2, icon_hs};
+		drawIconPanel_Confirmation(&pane);
+	}
 	else if (term2_icon_context == MICONS_ITEM)
 	{
-		SDL_Rect pane2 = { max_w - (64) * 4 - 1, top + icon_hs, (64) * 4 + 1, (64) * 5 };
+		SDL_Rect pane2 = { max_w - (64) * 4 - 1, top + icon_hs, (64) * 4 + 1, (64) * 7 };
 		drawIconPanel_Inventory(&pane2, micon_allow_inven, micon_allow_equip, micon_allow_floor);
 	}
 	else if (term2_icon_context == MICONS_EQUIP)
@@ -3660,13 +3779,18 @@ static void renderIconOverlay(TermData *td)
 	}
 	else if (term2_icon_context == MICONS_SPELL)
 	{
-		SDL_Rect pane2 = { max_w - (64) * 5, top + 64, (64) * 5, (64) * 5 };
+		SDL_Rect pane2 = { max_w - (64+1) * 5, top + 64, (64+1) * 5, (64) * 5 };
 		drawIconPanel_Spells(&pane2, micon_spell_realm, micon_spell_book);
+	}
+	else if (term2_icon_context == MICONS_STORE)
+	{
+		SDL_Rect pane = { max_w - 64, top + 64, MICON_W * 1, max_h };
+		drawIconPanel_Commands(&pane, MICONS_STORE);
 	}
 	/* User pref */
 	else if (term2_icon_pref == MICONS_INVEN)
 	{
-		SDL_Rect pane2 = { max_w - (64) * 4 - 1, top + icon_hs, (64) * 4 + 1, (64) * 5 };
+		SDL_Rect pane2 = { max_w - (64) * 4 - 1, top + icon_hs, (64) * 4 + 1, (64) * 7 };
 		drawIconPanel_Inventory(&pane2, 0, 0, 0);
 
 		micon_command_filter = MICONS_INVEN;
@@ -3752,20 +3876,32 @@ static void unloadTinyFont(void)
 	tx_tiny = NULL;
 }
 
-static errr iconText(int x, int y, byte attr, cptr s, bool tiny)
+static errr iconText(int x, int y, byte attr, cptr s, int tiny)
 {
 	int i;
+	int mult = 1;
 	TermData *td = &terms[0];
 	const char *c = s;
 	struct FontData *fd = td->font_data;
 	SDL_Texture *tx = td->font_texture;
 
 	/* Use tiny font instead */
-	if (tiny)
+	if (tiny > 0)
 	{
 		fd = &tiny_font;
 		tx = tx_tiny;
 	}
+
+#ifdef MOBILE_UI
+	/* Hack -- change size */
+	if (tiny == -2)
+	{
+		if (SDL_IsTablet() || isHighDPI())
+		{
+			mult = 2;
+		}
+	}
+#endif
 
 	/* Set color */
 	SDL_SetTextureColorMod(tx, TERM_RGB(attr));
@@ -3773,13 +3909,13 @@ static errr iconText(int x, int y, byte attr, cptr s, bool tiny)
 	/* Dump each character */
 	while (*c)
 	{
-		SDL_Rect cell_rect = { x, y, fd->w, fd->h	};
+		SDL_Rect cell_rect = { x, y, fd->w*mult, fd->h*mult };
 		int si = *c;
 		int row = si / 16;
 		int col = si - (row * 16);
 		SDL_Rect char_rect = { col*fd->w, row*fd->h, fd->w, fd->h };
 		SDL_RenderCopy(td->renderer, tx, &char_rect, &cell_rect);
-		x += fd->w;
+		x += fd->w*mult;
 		c++;
 	}
 	return 0;
@@ -3821,6 +3957,19 @@ static void drawUiIcon(SDL_Rect *dst, int k)
 	SDL_RenderCopy(td->renderer, tx_cmd, &cell_rect, dst);
 }
 
+static void recountSlotItems(void)
+{
+	size_t i;
+	for (i = 0; i < 10; i++)
+	{
+		SlotData *slot = &quick_slots[i];
+		if (!STRZERO(slot->macro_item))
+		{
+			slot->item_counter = count_items_by_name(slot->macro_item, TRUE, TRUE, TRUE);
+		}
+	}
+}
+
 static void convertIconToSlot(void *slot_p, void *icon_p, int slot_id)
 {
 	SlotData *slot = (SlotData*)slot_p;
@@ -3834,6 +3983,7 @@ static void convertIconToSlot(void *slot_p, void *icon_p, int slot_id)
 	slot->c = 0;
 
 	slot->macro_act[0] = '\0';
+	slot->macro_item[0] = '\0';
 	slot->display[0] = '\0';
 
 	/* Copy quick slot */
@@ -3841,17 +3991,22 @@ static void convertIconToSlot(void *slot_p, void *icon_p, int slot_id)
 	{
 		SlotData *orig = &quick_slots[icon->sub_action];
 
+		slot->action = orig->action;
+		slot->sub_action = orig->sub_action;
+		my_strcpy(slot->macro_act, orig->macro_act, 1024);
+		my_strcpy(slot->macro_item, orig->macro_item, 1024);
+		my_strcpy(slot->display, orig->display, 1024);
+
+		slot->draw = orig->draw;
+		slot->a = orig->a;
+		slot->c = orig->c;
+		slot->attr = orig->attr;
+		slot->item_counter = orig->item_counter;
+
 		if (orig->action == MICON_LOCAL_EXECUTE_MACRO)
 		{
 			slot->action = orig->action;
-			slot->sub_action = slot_id; /* Important */		
-			my_strcpy(slot->macro_act, orig->macro_act, 1024);
-			my_strcpy(slot->display, orig->display, 1024);
-
-			slot->draw = orig->draw;
-			slot->a = orig->a;
-			slot->c = orig->c;
-			slot->attr = orig->attr;
+			slot->sub_action = slot_id; /* Important */
 		}
 	}
 	else if (icon->action == MICON_SELECT_SPELL)
@@ -3881,6 +4036,13 @@ static void convertIconToSlot(void *slot_p, void *icon_p, int slot_id)
 		}
 
 		text_to_ascii(slot->macro_act, 1024, buf);
+
+		/* Extract "single name" */
+		buf[0] = '\0';
+		item_as_keystroke(book, cmd, buf, 1024, 0);
+		buf[strlen(buf)-1] = '\0';
+		my_strcpy(slot->macro_item, &buf[1], 1024);
+		slot->item_counter = inventory[book].number;
 
 		my_strcpy(slot->display, spell_info[book][sn] + 5,
 			(icon->pos.w+16+1) / tiny_font.w);
@@ -3916,9 +4078,19 @@ static void convertIconToSlot(void *slot_p, void *icon_p, int slot_id)
 
 		text_to_ascii(slot->macro_act, 1024, buf);
 
+		/* Extract "single name" */
+		buf[0] = '\0';
+		item_as_keystroke(idx, cmd, buf, 1024, 0);
+		buf[strlen(buf)-1] = '\0';
+		my_strcpy(slot->macro_item, &buf[1], 1024);
+		slot->item_counter = inventory[idx].number;
+
 		slot->action = MICON_LOCAL_EXECUTE_MACRO;
 		slot->sub_action = slot_id;
 	}
+
+	/* Always do it after creating new slot */
+	recountSlotItems();
 }
 
 static void handleMIcon(int action, int sub_action)
@@ -3974,6 +4146,20 @@ static void handleMIcon(int action, int sub_action)
 			/* Root selector */
 			case MICON_TOGGLE_ROOT:
 			{
+				/* Hack -- waiting for an item && action is toggle */
+				if ((
+				    (term2_icon_context == MICONS_EQUIP)
+				    && (sub_action == MICONS_INVEN)
+				    ) || (
+				    (term2_icon_context == MICONS_ITEM)
+				    && (sub_action == MICONS_EQUIP)
+				))
+				{
+					/* Toggle inven/equip */
+					Term_keypress('/');
+					break;
+				}
+
 				term2_icon_pref = sub_action;
 				if (sub_action == MICONS_QUICKEST) micon_command_filter = MICONS_QUICKEST;
 				if (sub_action == MICONS_ALTER) micon_command_filter = MICONS_ALTER;
@@ -3997,8 +4183,13 @@ static void handleMIcon(int action, int sub_action)
 			/* Command! */
 			case MICON_RUN_COMMAND:
 			{
-				int key = sub_action;
 				custom_command_type *cmd = &custom_command[sub_action];
+				/* Hack -- shop commands are handled differently: */
+				if (cmd->flag & COMMAND_STORE)
+				{
+					Term_keypress(cmd->m_catch);
+					break;
+				}
 				Term_keypress(29);
 				Term_keypress('\f');
 				Term_keypress(ESCAPE);
@@ -4006,7 +4197,8 @@ static void handleMIcon(int action, int sub_action)
 				Term_keypress(ESCAPE);
 				Term_keypress('\\');
 				Term_keypress(cmd->m_catch);
-				if (micon_command_filter == MICONS_SPELLS)
+				if ((micon_command_filter == MICONS_SPELLS)
+				   && (cmd->flag & COMMAND_NEED_SPELL))
 				{
 					if (term2_spell_pref > -1)
 					{
@@ -4016,7 +4208,8 @@ static void handleMIcon(int action, int sub_action)
 						Term_keypress('a' + sn);
 					}
 				}
-				if (micon_command_filter == MICONS_EQUIP)
+				if ((micon_command_filter == MICONS_EQUIP)
+				   && (cmd->flag & COMMAND_ITEM_EQUIP))
 				{
 					if (term2_item_pref > -1)
 					{
@@ -4041,11 +4234,16 @@ static void handleMIcon(int action, int sub_action)
 					else {
 					}
 				}
-				if (micon_command_filter == MICONS_INVEN)
+				if ((micon_command_filter == MICONS_INVEN)
+				   && (cmd->flag & COMMAND_ITEM_INVEN))
 				{
 					if (term2_item_pref > -1)
 					{
 						Term_keypress('a' + term2_item_pref);
+					}
+					if (term2_item_pref <= -11)
+					{
+						Term_keypress('-');
 					}
 				}
 				Term_keypress(30);
@@ -4055,6 +4253,13 @@ static void handleMIcon(int action, int sub_action)
 			case MICON_PICK_DIRECTION:
 			{
 				int key = '0' + sub_action;
+				Term_keypress(key);
+			}
+			break;
+			/* Confirmation */
+			case MICON_SINGLE_KEY:
+			{
+				int key = sub_action;
 				Term_keypress(key);
 			}
 			break;
@@ -4087,6 +4292,22 @@ static void handleMIcon(int action, int sub_action)
 				else
 				{
 					term2_item_pref = ind;
+				}
+			}
+			break;
+			/* Floor selection */
+			case MICON_SELECT_FLOOR:
+			{
+				int key = '-';
+				/* Waiting for an item */
+				if (term2_icon_context == MICONS_ITEM)
+				{
+					Term_keypress(key);
+				}
+				else
+				{
+					term2_icon_pref = MICONS_INVEN;
+					term2_item_pref = -11;
 				}
 			}
 			break;
@@ -4205,8 +4426,8 @@ static void renderMIcon(SDL_Rect *panel, SDL_Rect *pos, int action, int sub_acti
 static void drawIconPanel_Commands(SDL_Rect *size, int filter)
 {
 	int i;
-	int spacing = 16;
-	SDL_Rect pos = { 0, 0, 32, 32 };
+	int spacing = MICON_S;
+	SDL_Rect pos = { 0, 0, MICON_W, MICON_H };
 	pos.x = size->x;
 	pos.y = size->y;
 	pos.w *= 2;
@@ -4254,7 +4475,7 @@ static void drawIconPanel_Commands(SDL_Rect *size, int filter)
 		{
 			if (!(cmd->flag & COMMAND_ITEM_INVEN)) continue;
 			if (cmd->flag & COMMAND_STORE) continue;
-			if (term2_item_pref < 0)
+			if (term2_item_pref < 0 && floor_item.tval == 0)
 			{
 				if (cmd->tval) continue;
 			}
@@ -4263,7 +4484,8 @@ static void drawIconPanel_Commands(SDL_Rect *size, int filter)
 				if (!command_tester_okay(i, term2_item_pref)) continue;
 				if (cmd->tval != 0)
 				{
-					attr = inventory[term2_item_pref].sval;
+					if (term2_item_pref < 0) attr = floor_item.sval;
+					else attr = inventory[term2_item_pref].sval;
 				}
 			}
 		}
@@ -4283,6 +4505,14 @@ static void drawIconPanel_Commands(SDL_Rect *size, int filter)
 					attr = inventory[term2_item_pref].sval;
 				}
 			}
+		}
+		if (filter == MICONS_STORE)
+		{
+			//if (!(cmd->flag & COMMAND_ITEM_INVEN)) continue;
+			if (!(cmd->flag & COMMAND_STORE)) continue;
+			if (cmd->m_catch == 's') draw_key = MICO_SELL;
+			if (cmd->m_catch == 'p') draw_key = MICO_PURCHASE;
+			if (cmd->m_catch == 'l') draw_key = 'I';
 		}
 		if (filter == MICONS_SPELLS)
 		{
@@ -4304,6 +4534,7 @@ static void drawIconPanel_Commands(SDL_Rect *size, int filter)
 		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, 'M', 'M', spacing);
 		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, '*', '*', spacing);
 		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, '(', '(', spacing);
+		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, 'L', 'L', spacing);
 	}
 	if (filter == MICONS_SYSTEM)
 	{
@@ -4311,6 +4542,11 @@ static void drawIconPanel_Commands(SDL_Rect *size, int filter)
 		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, ':', ':', spacing);
 		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, KTRL('D'), 0xE4, spacing);
 		renderMIcon(size, &pos, MICON_LOCAL_COMMAND_HACK, KTRL('P'), 0xF0, spacing);
+	}
+	if (filter == MICONS_STORE)
+	{
+		SDL_SetTextureColorMod(tx_cmd, TERM_RGB(TERM_WHITE));
+		renderMIcon(size, &pos, MICON_SINGLE_KEY, ' ', '3', spacing);
 	}
 	
 	/* Undo modulation */
@@ -4331,6 +4567,25 @@ static void drawIconPanel_Direction(SDL_Rect *size, bool allow_target, bool allo
 		int j = dirs[i];
 		int draw = '0' + j;
 		renderMIcon(size, &pos, MICON_PICK_DIRECTION, j, draw, spacing);
+		if (pos.y >= size->y + size->h) break;
+	}
+}
+
+static void drawIconPanel_Confirmation(SDL_Rect *size)
+{
+	int i;
+	int spacing = MICON_W * 2;
+	int keys[2] = { 'y', 'n' };
+	int syms[2] = { MICO_YES, MICO_NO };
+	SDL_Rect pos = { 0, 0, MICON_W * 2, MICON_H * 2 };
+	pos.x = size->x;
+	pos.y = size->y;
+	pos.w *= 2;
+	pos.h *= 2;
+	spacing *= 2;
+	for (i = 0; i < 2; i++)
+	{
+		renderMIcon(size, &pos, MICON_SINGLE_KEY, keys[i], syms[i], spacing);
 		if (pos.y >= size->y + size->h) break;
 	}
 }
@@ -4371,6 +4626,7 @@ static void drawIconPanel_Inventory(SDL_Rect *size, bool inven, bool equip, bool
 	int i;
 	int spacing = 0;
 	SDL_Rect pos = { 0, 0, 32, 32 };
+	SDL_Rect pre_pos;
 	int fw = terms[0].font_data->w;
 	int fh = terms[0].font_data->h;
 	char numbuf[8] = { 0 };
@@ -4380,10 +4636,12 @@ static void drawIconPanel_Inventory(SDL_Rect *size, bool inven, bool equip, bool
 	pos.w *= 2;
 	pos.h *= 2;
 
+	/*
 	SDL_SetRenderDrawColor(terms[0].renderer, 0, 0, 0, 255);
 	SDL_RenderDrawRect(terms[0].renderer, size);
+	*/
 
-	for (i = 0; i < INVEN_WIELD; i++)
+	for (i = 0; i < INVEN_WIELD - 1; i++)
 	{
 		/* Highlight selected item */
 		if (term2_item_pref == i)
@@ -4418,6 +4676,51 @@ static void drawIconPanel_Inventory(SDL_Rect *size, bool inven, bool equip, bool
 		/* And an actual icon */
 		renderMIcon(size, &pos, MICON_SELECT_INVEN, i, -2, spacing);
 		if (pos.y >= size->y + size->h) break;
+	}
+
+	if ((INVEN_WIELD-1) % 4 != 0)
+	{
+		pos.y += pos.h;
+	}
+
+	/* Add Inven/Equip toggle */
+	if (equip || term2_icon_context != MICONS_ITEM)
+	{
+		pos.x = size->x;
+		renderMIcon(size, &pos, MICON_TOGGLE_ROOT, MICONS_EQUIP, 'e', spacing);
+	}
+
+	/* Add Floor toggle */
+	if (onfloor || term2_icon_context != MICONS_ITEM)
+	{
+		pos.x = size->x + size->w - pos.w;
+		if (term2_item_pref == -11)
+		{
+			SDL_Rect box = { size->x + size->w - 60 * fw, 32 + 16,
+				60 * fw, fh * 2 };
+			SDL_SetRenderDrawColor(terms[0].renderer, 0, 0, 0, 200);
+			SDL_RenderFillRect(terms[0].renderer, &box);
+			iconText(box.x+fw, box.y+fh/3, floor_item.sval, floor_name, FALSE);
+			SDL_SetRenderDrawColor(terms[0].renderer, 255, 255, 255, 210);
+
+			SDL_SetRenderDrawColor(terms[0].renderer, 255, 255, 255, 210);
+		}
+		else
+		{
+			SDL_SetRenderDrawColor(terms[0].renderer, 64, 32, 0, 200);
+		}
+		SDL_RenderFillRect(terms[0].renderer, &pos);
+		pre_pos = pos;
+		renderMIcon(size, &pos, MICON_SELECT_FLOOR, -11, MICO_FLOOR_ITEM, spacing);
+		if (floor_item.tval)
+		{
+			iconPict(&pre_pos, floor_item.ix, floor_item.iy, TRUE);
+		}
+		if (floor_item.number > 1)
+		{
+			sprintf(numbuf, "%2d", floor_item.number);
+			iconText(pre_pos.x + pre_pos.w - fw*2, pre_pos.y + pre_pos.h-fh, floor_item.sval, numbuf, FALSE);
+		}
 	}
 }
 
@@ -4492,6 +4795,11 @@ static void drawIconPanel_Equipment(SDL_Rect *size, bool inven, bool equip, bool
 	/* And a giant "fake" icon to prevent click-through */
 	xsize = *size;
 	renderMIcon(&xsize, &xsize, -1, -1, -1, 0);
+
+	/* Add Inven/Equip toggle */
+	pos.x = size->x;
+	pos.y += pos.w;
+	renderMIcon(size, &pos, MICON_TOGGLE_ROOT, MICONS_INVEN, 'i', spacing);
 }
 
 static void drawIconPanel_Spells(SDL_Rect *size, int spell_realm, int spell_book)
@@ -4578,13 +4886,16 @@ static void drawIconPanel_Slots(SDL_Rect *size)
 	int i, j;
 	int spacing = 16;
 	SDL_Rect pos = { 0, 0, 32, 32 };
+	int fw = terms[0].font_data->w;
+	int fh = terms[0].font_data->h;
 	char posbuf[2] = { 0 };
+	char numbuf[8] = { 0 };
 	pos.x = size->x;
 	pos.y = size->y;
 	pos.w *= 2;
 	pos.h *= 2;
 	SDL_SetTextureAlphaMod(terms[0].pict_texture, 255);
-	SDL_SetTextureColorMod(terms[0].pict_texture, 255,255,255);
+	SDL_SetTextureColorMod(terms[0].pict_texture, 255, 255, 255);
 	for (i = 0; i < 10; i++)
 	{
 		SDL_Rect pre_pos;
@@ -4599,13 +4910,14 @@ static void drawIconPanel_Slots(SDL_Rect *size)
 			}
 			else
 			{
-				SDL_SetRenderDrawColor(terms[0].renderer, 255, 255, 255, 190);			
-			}	
+				SDL_SetRenderDrawColor(terms[0].renderer, 255, 255, 255, 190);
+			}
 		}
 		else
 		{
 			SDL_SetRenderDrawColor(terms[0].renderer, 255, 255, 255, 64);
 		}
+
 		SDL_RenderDrawRect(terms[0].renderer, &pos);
 
 		iconText(pos.x+1, pos.y+1, TERM_WHITE, posbuf, FALSE);
@@ -4614,14 +4926,72 @@ static void drawIconPanel_Slots(SDL_Rect *size)
 
 		pre_pos = pos;
 		renderMIcon(size, &pos, MICON_LOCAL_QUICK_SLOT, i, slot->draw, spacing);
-
+		if (slot->draw == MICO_FLOOR_ITEM || slot->draw == 'g')
+		{
+			if (floor_item.tval)
+			{
+				iconPict(&pre_pos, floor_item.ix, floor_item.iy, TRUE);
+			}
+			if (floor_item.number > 1)
+			{
+				sprintf(numbuf, "%2d", floor_item.number);
+				iconText(pre_pos.x + pre_pos.w - fw*2, pre_pos.y + pre_pos.h-fh, floor_item.sval, numbuf, FALSE);
+			}
+		}
 		if (!STRZERO(slot->display))
+		{
 			iconText(pre_pos.x + 1, pre_pos.y + pos.h - tiny_font.h - 1,
 				slot->attr, slot->display, TRUE);
+		}
+		else if (!STRZERO(slot->macro_item))
+		{
+			strnfmt(numbuf, 8, "%2d", slot->item_counter);
+			iconText(pre_pos.x + pre_pos.w - fw * 2, pre_pos.y + pos.h - fh,
+				TERM_WHITE, numbuf, FALSE);
+		}
 
 		if (pos.y >= size->y + size->h) break;
 	}
 }
+
+static void drawIconPanel_PassedMenu(SDL_Rect *size)
+{
+	int i, j;
+	int spacing = MICON_S;
+	SDL_Rect pos = { 0, 0, MICON_W, MICON_H };
+	int fw = terms[0].font_data->w;
+	int fh = terms[0].font_data->h;
+#ifdef MOBILE_UI
+	if (isHighDPI())
+	{
+		fw *= 2;
+		fh *= 2;
+	}
+#endif
+	pos.x = size->x;
+	pos.y = size->y;
+	pos.w = 0;
+	pos.h = fh + fh / 2;
+
+	SDL_SetRenderDrawColor(terms[0].renderer, 0, 0, 0, 255);
+	SDL_RenderFillRect(terms[0].renderer, size);
+
+	for (i = 0; i < micon_passed_menu->count; i++)
+	{
+		char tmp[8];
+		char buf[80];
+		char sel = micon_passed_menu->selections[i];
+		micon_passed_menu_resolver(buf, 80, micon_passed_menu, i);
+		strnfmt(tmp, 4, "%c) ", sel);
+		if (STRZERO(buf)) tmp[0] = '\0';
+		iconText(pos.x, pos.y + pos.h / 2 - fh / 2, TERM_WHITE, tmp, -2);
+		iconText(pos.x + fw * 3, pos.y + pos.h / 2 - fh / 2, TERM_WHITE, buf, -2);
+		pos.w = 13 * fw;
+		renderMIcon(size, &pos, MICON_SINGLE_KEY, sel, -1, spacing);
+		if (pos.y >= size->y + size->h) break;
+	}
+}
+
 #endif /* USE_ICON_OVERLAY */
 
 

@@ -493,7 +493,14 @@ errr Term_show_keyboard(int hint)
 }
 errr Term_hide_keyboard(void)
 {
-	if (screen_keyboard_aux) screen_keyboard_aux(1, 0);
+	if (screen_keyboard_aux) screen_keyboard_aux(0, 0);
+	return 0;
+}
+
+/* Hack -- wrapper around Term2/window_updated_aux (see below) */
+errr Term_window_updated(u32b window_flags)
+{
+	if (window_updated_aux) window_updated_aux(window_flags);
 	return 0;
 }
 
@@ -502,9 +509,10 @@ bool (*cave_char_aux)(int x, int y, byte a, char c, byte ta, char tc) = NULL;
 void (*query_size_aux)(s16b *x, s16b *y, int st) = NULL;
 void (*refresh_char_aux)(int x, int y) = NULL;
 void (*screen_keyboard_aux)(int show, int hint) = NULL;
-bool (*z_ask_command_aux)(char *prompt) = NULL;
-bool (*z_ask_yn_aux)(char *prompt) = NULL;
-bool (*z_ask_dir_aux)(char *prompt, bool allow_target, bool allow_friend) = NULL;
+void (*window_updated_aux)(u32b flags) = NULL;
+bool (*z_ask_command_aux)(const char *prompt, bool shopping) = NULL;
+bool (*z_ask_confirm_aux)(const char *prompt) = NULL;
+bool (*z_ask_dir_aux)(const char *prompt, bool allow_target, bool allow_friend) = NULL;
 bool (*z_ask_item_aux)(const char *prompt, bool mode, bool inven, bool equip, bool allow_floor) = NULL;
 bool (*z_ask_spell_aux)(const char *prompt, int realm, int book) = NULL;
 
@@ -1178,6 +1186,7 @@ errr Term_fresh(void)
 	term_win *old = Term->old;
 	term_win *scr = Term->scr;
 
+	bool updated_cursor_or_glyph = FALSE;
 
 	/* Do nothing unless "mapped" */
 	if (!Term->mapped_flag) return (1);
@@ -1274,6 +1283,7 @@ errr Term_fresh(void)
 			byte ota = old_taa[tx];
 			char otc = old_tcc[tx];
 
+			updated_cursor_or_glyph = TRUE;
 /* Hack -- some terminals don't have double-buffering, so constantly
  * erasing and drawing the cursor back will give an undesired,
  * flickering effect.
@@ -1282,7 +1292,9 @@ errr Term_fresh(void)
  * a crude ifdef, for WIN client only. */
 /* NOTE: Alternatively, this might be a good change for ALL
  * the terminals, but it would require a considerable amount of testing. */
-#ifdef USE_WIN
+/* NOTE: Seems to be a good change for SDL2, as this actually stops the
+ * constant spamming of cursor redrawing. */
+#if defined(USE_WIN) || defined(USE_SDL2)
 			if (oa == scr->a[ty][tx] /* The tile itself didn't change */
 			&&  oc == scr->c[ty][tx]
 			&&  ota == scr->ta[ty][tx]
@@ -1292,6 +1304,7 @@ errr Term_fresh(void)
 			&&  old->cv == scr->bcv)  /* The cursor visibility didn't change */
 			{
 				/* Do nothing */
+				updated_cursor_or_glyph = FALSE;
 			} else
 #endif
 			/* Hack -- use "Term_pict()" always */
@@ -1384,6 +1397,7 @@ errr Term_fresh(void)
 				/* This row is all done */
 				Term->x1[y] = w;
 				Term->x2[y] = 0;
+				updated_cursor_or_glyph = TRUE;
 
 				/* Hack -- Flush that row (if allowed) */
 				if (!Term->never_frosh) Term_xtra(TERM_XTRA_FROSH, y);
@@ -1395,6 +1409,12 @@ errr Term_fresh(void)
 		Term->y2 = 0;
 	}
 
+	/* HACK -- Nothing changed. */
+	/* NOTE: this behavior is largely untested, so for now
+	 * I'm marking it as SDL2-only. */
+#if defined(USE_SDL2)
+	if (!updated_cursor_or_glyph) return (1);
+#endif
 
 	/* Cursor update -- Show new Cursor */
 	if (Term->soft_cursor)

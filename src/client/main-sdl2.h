@@ -164,7 +164,6 @@ static errr pictTermHook_ALT(int x, int y, int n, const byte *ap, const char *cp
 static errr loadUiCircle(void);
 static void unloadUiCircle(void);
 static void updateLisenglas(int wx, int wy);
-static void renderZoomOverlay(TermData *td);
 
 /* MIcons Overlay */
 enum IconAction {
@@ -180,6 +179,7 @@ enum IconAction {
 
 	MICON_SELECT_INVEN,
 	MICON_SELECT_EQUIP,
+	MICON_SELECT_FLOOR,
 	MICON_SELECT_SPELL,
 
 	MICON_ESCAPE,
@@ -200,14 +200,15 @@ static void unloadTinyFont(void);
 static void renderIconOverlay(TermData *td);
 static void altCoord(int wx, int wy, int *x, int *t);
 static void renderLisenGlas(TermData *td);
-static void drawIconPanel(SDL_Rect *size, int ctx);
 static void drawIconPanel_Commands(SDL_Rect *size, int filter);
 static void drawIconPanel_Direction(SDL_Rect *size, bool allow_target, bool allow_friend);
+static void drawIconPanel_Confirmation(SDL_Rect *size);
 static void drawIconPanel_Selector(SDL_Rect *size, int filter);
 static void drawIconPanel_Inventory(SDL_Rect *size, bool allow_inven, bool allow_equip, bool allow_floor);
 static void drawIconPanel_Equipment(SDL_Rect *size, bool allow_inven, bool allow_equip, bool allow_floor);
 static void drawIconPanel_Spells(SDL_Rect *size, int spell_realm, int spell_book);
 static void drawIconPanel_Slots(SDL_Rect *size);
+static void drawIconPanel_PassedMenu(SDL_Rect *size);
 static errr iconPict(SDL_Rect *pos, byte a, char c, bool remember);
 static void drawUiIcon(SDL_Rect *pos, int k);
 static int matchIcon(int wx, int wy);
@@ -242,3 +243,5 @@ static void convertIconToSlot(void *slot, void *icon, int slot_id);
 #define MICO_SPELL_UNKNOWN 0xD5
 #define MICO_SPELL_ILLEGIBLE 0xD6
 #define MICO_SPELL_PROJECT 0xD7
+#define MICO_SELL 0xEE
+#define MICO_PURCHASE 0xE2
